@@ -43,9 +43,29 @@ class Tokenizer:
         self.bytes_to_id = {b: i for i, b in self.id_to_bytes.items()}
         self.merges = merges
 
-        # change merge to
+        # handling special tokens
+        # if input text has <|endoftext|> we should encode/encode it as atomic token
         self.special_tokens = special_tokens or []
 
+        # Ensure all specials are in vocab
+        # E.g. we have double end-of-text as special token
+
+
+        for s in self.special_tokens:
+            sb = s.encode("utf-8")
+            if sb not in self.bytes_to_id:
+                new_id = max(self.id_to_bytes.keys()) + 1
+                self.id_to_bytes[new_id] = sb
+                self.bytes_to_id[sb] = new_id
+
+        # Compile regex for splitting on specials
+        if self.special_tokens:
+            escaped = [re.escape(s) for s in self.special_tokens]
+            # longest first so the double marker wins over the single
+            escaped.sort(key=len, reverse=True)
+            self._special_split_re = re.compile("(" + "|".join(escaped) + ")")
+        else:
+            self._special_split_re = None
 
     @classmethod
     def from_files(cls, vocab_filepath: str, merges_filepath: str, special_tokens: list | None = None):
@@ -77,10 +97,24 @@ class Tokenizer:
         # text: the cat ate
         # pretokenized: [b'the', b' cat', b' ate']
         ids = []
-        pretokenized = _pretokenize_gpt2(text)
-        for pretok in pretokenized:
-            merged_chunks = self._apply_merges(pretok)
-            ids.extend(self._map_chunks_to_ids(merged_chunks))
+
+        # before doing gpt2 pretokenization, use special token re to split normal words with special tokens
+        # "Hi<|endoftext|>there" -> ["Hi", "<|endoftext|>", "there"]
+
+        # 'Héllò hôw <|endoftext|><|endoftext|> are ü? 🙃<|endoftext|>'
+        # =>
+        # [('Héllò hôw ', False), ('<|endoftext|>', True), ('', False), ('<|endoftext|>', True), (' are ü? 🙃', False),
+        #  ('<|endoftext|>', True), ('', False)]
+        split_specials = self._split_specials(text)
+        for segment, is_special in split_specials:
+            if is_special:
+                sb = segment.encode("utf-8")
+                ids.append(self.bytes_to_id[sb])
+                continue
+            pretokenized = _pretokenize_gpt2(segment)
+            for pretok in pretokenized:
+                merged_chunks = self._apply_merges(pretok)
+                ids.extend(self._map_chunks_to_ids(merged_chunks))
         return ids
 
     def encode_iterable(self, iterable):
@@ -90,12 +124,16 @@ class Tokenizer:
         so tokens never cross chunk boundaries (streaming-friendly).
         """
         for text in iterable:
-            # same steps as encode(), but yield ids as we go
-            pretokenized = _pretokenize_gpt2(text)
-            for pretok in pretokenized:
-                merged_chunks = self._apply_merges(pretok)
-                for tid in self._map_chunks_to_ids(merged_chunks):
-                    yield tid
+            for segment, is_special in self._split_specials(text):
+                if is_special:
+                    sb = segment.encode("utf-8")
+                    yield self.bytes_to_id[sb]
+                else:
+                    pretokenized = _pretokenize_gpt2(segment)
+                    for pretok in pretokenized:
+                        merged = self._apply_merges(pretok)
+                        for tid in self._map_chunks_to_ids(merged):
+                            yield tid
 
     def decode(self, ids: list[int]) -> str:
         buf = bytearray()
@@ -131,6 +169,17 @@ class Tokenizer:
                     break
         return seq
 
+    def _split_specials(self, text):
+        """Return [(segment, is_special: bool), ...]."""
+        # no special tokens?
+        if not self._special_split_re:
+            return [(text, False)]
+        parts = self._special_split_re.split(text)
+        out = []
+        special_set = set(self.special_tokens)
+        for p in parts:
+            out.append((p, p in special_set))
+        return out
     def _map_chunks_to_ids(self, chunks) -> list[int]:
         out = []
         for tok in chunks:
